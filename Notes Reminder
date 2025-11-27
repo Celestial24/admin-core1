@@ -12,3 +12,26 @@ punta ka dito Sa Site na ito
 http://localhost/core1admin/index.php
 
 
+panno mag pull and push sa github
+
+kung git clone mo folder mo ito sa xampp 
+
+cd C:\xampp\htdocs Enter mo 
+git clone https://github.com/Celestial24/admin-core1.git tapos 
+
+parang ganyan lalabas yan pag push mo 
+
+Enumerating objects: 90, done.
+Counting objects: 100% (90/90), done.
+Delta compression using up to 8 threads
+Compressing objects: 100% (88/88), done.
+Writing objects: 100% (90/90), 193.04 KiB | 2.92 MiB/s, done.
+Total 90 (delta 13), reused 0 (delta 0), pack-reused 0 (from 0)
+remote: Resolving deltas: 100% (13/13), done.
+To https://github.com/Celestial24/admin-core1.git
+ * [new branch]      main -> main
+ 
+ tapos kapag update mo 
+
+ 
+
