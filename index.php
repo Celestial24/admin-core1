@@ -462,9 +462,127 @@ function handle_logout() {
 }
 
 /**
- * Handles profile updates, including phone_number.
+ * Returns the absolute path where profile images are stored.
  */
-function update_admin_profile($pdo, $id, $new_username, $full_name, $email, $phone_number, $current_password, $new_password = null) {
+function get_profile_upload_directory() {
+    return __DIR__ . DIRECTORY_SEPARATOR . 'uploads' . DIRECTORY_SEPARATOR . 'profile';
+}
+
+/**
+ * Ensures the profile upload directory exists.
+ */
+function ensure_profile_upload_directory() {
+    $directory = get_profile_upload_directory();
+    if (!is_dir($directory)) {
+        if (!mkdir($directory, 0755, true) && !is_dir($directory)) {
+            throw new RuntimeException("Failed to create profile upload directory at {$directory}");
+        }
+    }
+    return $directory;
+}
+
+/**
+ * Handles moving the uploaded profile image to the uploads folder.
+ */
+function handle_profile_image_upload($file, $admin_id) {
+    if (!$file || !isset($file['error'])) {
+        return ['success' => false, 'message' => 'Invalid file payload.'];
+    }
+
+    if ($file['error'] === UPLOAD_ERR_NO_FILE) {
+        return ['success' => false, 'message' => 'No file uploaded.'];
+    }
+
+    if ($file['error'] !== UPLOAD_ERR_OK) {
+        return ['success' => false, 'message' => 'Upload error code: ' . $file['error']];
+    }
+
+    if (!is_uploaded_file($file['tmp_name'])) {
+        return ['success' => false, 'message' => 'Invalid upload source detected.'];
+    }
+
+    if (!is_numeric($admin_id) || intval($admin_id) <= 0) {
+        return ['success' => false, 'message' => 'Invalid admin reference for upload.'];
+    }
+
+    $maxSize = 2 * 1024 * 1024; // 2MB
+    if ($file['size'] > $maxSize) {
+        return ['success' => false, 'message' => 'Profile image must be 2MB or smaller.'];
+    }
+
+    $allowedExtensions = ['jpg', 'jpeg', 'png', 'webp'];
+    $extension = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
+    if ($extension === 'jpeg') {
+        $extension = 'jpg';
+    }
+
+    if (!in_array($extension, $allowedExtensions, true)) {
+        return ['success' => false, 'message' => 'Only JPG, PNG, or WEBP files are allowed.'];
+    }
+
+    if (function_exists('mime_content_type')) {
+        $detectedMime = mime_content_type($file['tmp_name']);
+        $allowedMimes = ['image/jpeg', 'image/png', 'image/webp'];
+        if ($detectedMime && !in_array($detectedMime, $allowedMimes, true)) {
+            return ['success' => false, 'message' => 'Unsupported image format uploaded.'];
+        }
+    }
+
+    try {
+        $directory = ensure_profile_upload_directory();
+    } catch (RuntimeException $e) {
+        return ['success' => false, 'message' => $e->getMessage()];
+    }
+    $cleanAdminId = intval($admin_id);
+
+    foreach (glob($directory . DIRECTORY_SEPARATOR . $cleanAdminId . '_*.*') as $oldFile) {
+        @unlink($oldFile);
+    }
+
+    $filename = $cleanAdminId . '_' . time() . '.' . $extension;
+    $targetPath = $directory . DIRECTORY_SEPARATOR . $filename;
+
+    if (!move_uploaded_file($file['tmp_name'], $targetPath)) {
+        return ['success' => false, 'message' => 'Failed to save profile image.'];
+    }
+
+    $relativePath = str_replace('\\', '/', str_replace(__DIR__ . DIRECTORY_SEPARATOR, '', $targetPath));
+
+    return [
+        'success' => true,
+        'path' => $relativePath,
+        'message' => 'Profile image updated successfully.'
+    ];
+}
+
+/**
+ * Retrieves the latest uploaded profile image URL for display.
+ */
+function get_admin_profile_image_url($admin_id) {
+    if (!$admin_id) {
+        return null;
+    }
+
+    $directory = get_profile_upload_directory();
+    $pattern = $directory . DIRECTORY_SEPARATOR . intval($admin_id) . '_*.*';
+    $files = glob($pattern);
+
+    if (!$files) {
+        return null;
+    }
+
+    rsort($files);
+    $latest = $files[0];
+    $relativePath = str_replace('\\', '/', str_replace(__DIR__ . DIRECTORY_SEPARATOR, '', $latest));
+    $version = filemtime($latest) ?: time();
+
+    return $relativePath . '?v=' . $version;
+}
+
+/**
+ * Handles profile updates, including phone number and optional profile image.
+ */
+function update_admin_profile($pdo, $id, $new_username, $full_name, $email, $phone_number, $current_password, $new_password = null, $profile_image_file = null) {
     $user = get_admin_user_details($pdo, $id);
     
     if (!$user || !password_verify($current_password, $user['password_hash'])) {
@@ -493,7 +611,16 @@ function update_admin_profile($pdo, $id, $new_username, $full_name, $email, $pho
         $stmt->execute($params);
         $_SESSION['admin_username'] = $new_username;
 
-        return $message;
+        $imageMessage = '';
+        if ($profile_image_file && isset($profile_image_file['error']) && $profile_image_file['error'] !== UPLOAD_ERR_NO_FILE) {
+            $upload_result = handle_profile_image_upload($profile_image_file, $id);
+            if (!$upload_result['success']) {
+                return "Profile update failed: " . $upload_result['message'];
+            }
+            $imageMessage = " Profile photo updated!";
+        }
+
+        return $message . $imageMessage;
     } catch (PDOException $e) {
         error_log("Database Error in update_admin_profile: " . $e->getMessage());
         return "Profile update failed due to a database error.";
@@ -528,7 +655,7 @@ function update_order_status($order_id, $new_status, $pdo = null) {
 // FORM HANDLER (Handles all POST requests)
 // ===========================================
 
-function handle_form_submission($pdo, $action, $post_data) {
+function handle_form_submission($pdo, $action, $post_data, $files = []) {
     $result_message = "";
     $redirect_base = basename(__FILE__);
 
@@ -650,7 +777,8 @@ function handle_form_submission($pdo, $action, $post_data) {
                 $post_data['email'] ?? '',
                 $post_data['phone_number'] ?? '', // Phone number is optional in profile update
                 $post_data['current_password'] ?? '',
-                $post_data['new_password'] ?? ''
+                $post_data['new_password'] ?? '',
+                $files['profile_image'] ?? null
             );
             
             header("Location: " . $redirect_base . "?module=user&submodule=profile&msg=" . urlencode($result_message));
@@ -823,7 +951,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['action'])) {
         header("Location: " . basename(__FILE__) . "?msg=" . urlencode("FATAL: System functions failed to load."));
         exit();
     }
-    handle_form_submission($pdo, $_POST['action'], $_POST);
+    handle_form_submission($pdo, $_POST['action'], $_POST, $_FILES ?? []);
 }
 
 // Check login status
@@ -855,7 +983,13 @@ $admin_role = htmlspecialchars($_SESSION['admin_role'] ?? 'User');
 // Fetch admin details for the profile page if logged in
 $admin_details = [];
 if ($is_logged_in && isset($_SESSION['admin_id'])) {
-    $admin_details = get_admin_user_details($pdo, $_SESSION['admin_id']);
+    $admin_details = get_admin_user_details($pdo, $_SESSION['admin_id']) ?: [];
+    unset($admin_details['password_hash'], $admin_details['otp_code'], $admin_details['otp_expiry']);
+
+    $profileImageUrl = get_admin_profile_image_url($_SESSION['admin_id']);
+    if ($profileImageUrl) {
+        $admin_details['profile_image_url'] = $profileImageUrl;
+    }
 }
 
 // Fetch data from database for display
@@ -2058,7 +2192,7 @@ if ($is_logged_in) {
         const kpiData = <?php echo json_encode($kpi_data); ?>;
         const productsData = <?php echo json_encode($mock_products); ?>;
         const ordersData = <?php echo json_encode($mock_orders); ?>;
-        const adminDetails = <?php echo json_encode($admin_details); ?>;
+        const adminDetails = <?php echo json_encode(!empty($admin_details) ? $admin_details : new stdClass()); ?>;
         const categoriesData = <?php echo json_encode($mock_categories); ?>;
         const transactionsData = <?php echo json_encode($mock_transactions); ?>;
         const shipmentsData = <?php echo json_encode($mock_shipments); ?>;
@@ -3148,12 +3282,15 @@ if ($is_logged_in) {
             const currentFullName = adminDetails.full_name || '';
             const currentEmail = adminDetails.email || '';
             const currentPhoneNumber = adminDetails.phone_number || '';
+            const profileImageUrl = adminDetails.profile_image_url || '';
 
             switch (submodule) {
                 case 'profile':
                     moduleTitle = 'Admin Profile (Functional Update)';
                     const accountCreatedAt = adminDetails.created_at ? new Date(adminDetails.created_at).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }) : 'N/A';
                     const lastUpdated = adminDetails.updated_at ? new Date(adminDetails.updated_at).toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' }) : 'N/A';
+                    const avatarFallback = `https://placehold.co/140x140/4bc5ec/FFFFFF?text=${currentUsername.charAt(0).toUpperCase() || 'A'}`;
+                    const avatarSrc = profileImageUrl || avatarFallback;
                     
                     submoduleContent = `
                         <div class="module-container" style="grid-template-columns: 1fr; gap: 1.5rem;">
@@ -3162,11 +3299,12 @@ if ($is_logged_in) {
                                 <div style="display: flex; gap: 2rem; align-items: flex-start; flex-wrap: wrap;">
                                     <div style="position: relative; flex-shrink: 0;">
                                         <img id="profile-avatar" 
-                                            src="https://placehold.co/140x140/4bc5ec/FFFFFF?text=${currentUsername.charAt(0).toUpperCase() || 'A'}" 
+                                            src="${avatarSrc}" 
                                             alt="Admin Avatar"
                                             style="width: 140px; height: 140px; border-radius: 50%; border: 4px solid rgba(255,255,255,0.3); object-fit: cover; box-shadow: 0 8px 16px rgba(0,0,0,0.2);">
                                         <button type="button" 
-                                            onclick="showCustomActionModal('Picture Upload', 'Picture upload feature will be available soon.', 'OK')"
+                                            onclick="triggerProfileImagePicker()"
+                                            title="Upload new picture"
                                             style="position: absolute; bottom: 10px; right: 10px; background: var(--color-white); color: var(--color-primary-dark); border: none; border-radius: 50%; width: 36px; height: 36px; display: flex; align-items: center; justify-content: center; cursor: pointer; box-shadow: 0 4px 8px rgba(0,0,0,0.2); transition: transform 0.2s;"
                                             onmouseover="this.style.transform='scale(1.1)'"
                                             onmouseout="this.style.transform='scale(1)'">
@@ -3219,10 +3357,11 @@ if ($is_logged_in) {
                                     </div>
                                 </div>
 
-                                <form id="profile-edit-form" method="POST" action="<?php echo basename(__FILE__); ?>" onsubmit="return validateProfileForm(event);">
+                                <form id="profile-edit-form" method="POST" action="<?php echo basename(__FILE__); ?>" enctype="multipart/form-data" onsubmit="return validateProfileForm(event);">
                                     <input type="hidden" name="action" value="update_profile">
                                     <input type="hidden" name="module" value="user">
                                     <input type="hidden" name="submodule" value="profile">
+                                    <input type="file" id="profile_image" name="profile_image" accept="image/png,image/jpeg,image/jpg,image/webp" style="display: none;" onchange="handleProfileImageChange(event)">
 
                                     <!-- Personal Information Section -->
                                     <div style="margin-bottom: 2.5rem;">
@@ -3433,6 +3572,31 @@ if ($is_logged_in) {
 
             content.innerHTML = `<h2 class="page-header">${moduleTitle}</h2>${submoduleContent}`;
             lucide.createIcons();
+        }
+        
+        function triggerProfileImagePicker() {
+            const fileInput = document.getElementById('profile_image');
+            if (fileInput) {
+                fileInput.click();
+            }
+        }
+        
+        function handleProfileImageChange(event) {
+            const file = event.target.files && event.target.files[0];
+            if (!file) {
+                return;
+            }
+            
+            if (file.size > 2 * 1024 * 1024) {
+                showCustomActionModal('Error', 'Profile image must be 2MB or smaller.', 'OK');
+                event.target.value = '';
+                return;
+            }
+            
+            const preview = document.getElementById('profile-avatar');
+            if (preview) {
+                preview.src = URL.createObjectURL(file);
+            }
         }
         
         // Form Validation for Profile Update

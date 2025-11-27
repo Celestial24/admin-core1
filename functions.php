@@ -59,7 +59,7 @@ function get_admin_user_by_username($pdo, $username) {
 if (!function_exists('get_admin_user_details')) {
 function get_admin_user_details($pdo, $id) {
     try {
-        $stmt = $pdo->prepare("SELECT id, username, role, full_name, email, phone_number, password_hash, otp_code, otp_expiry FROM admin_users WHERE id = ?");
+        $stmt = $pdo->prepare("SELECT id, username, role, full_name, email, phone_number, password_hash, otp_code, otp_expiry, created_at, updated_at FROM admin_users WHERE id = ?");
         $stmt->execute([$id]);
         return $stmt->fetch(PDO::FETCH_ASSOC);
     } catch (PDOException $e) {
@@ -255,11 +255,124 @@ function handle_logout() {
 }
 }
 
+if (!function_exists('get_profile_upload_directory')) {
+function get_profile_upload_directory() {
+    return __DIR__ . DIRECTORY_SEPARATOR . 'uploads' . DIRECTORY_SEPARATOR . 'profile';
+}
+}
+
+if (!function_exists('ensure_profile_upload_directory')) {
+function ensure_profile_upload_directory() {
+    $directory = get_profile_upload_directory();
+    if (!is_dir($directory)) {
+        if (!mkdir($directory, 0755, true) && !is_dir($directory)) {
+            throw new RuntimeException("Failed to create profile upload directory at {$directory}");
+        }
+    }
+    return $directory;
+}
+}
+
+if (!function_exists('handle_profile_image_upload')) {
+function handle_profile_image_upload($file, $admin_id) {
+    if (!$file || !isset($file['error'])) {
+        return ['success' => false, 'message' => 'Invalid file payload.'];
+    }
+
+    if ($file['error'] === UPLOAD_ERR_NO_FILE) {
+        return ['success' => false, 'message' => 'No file uploaded.'];
+    }
+
+    if ($file['error'] !== UPLOAD_ERR_OK) {
+        return ['success' => false, 'message' => 'Upload error code: ' . $file['error']];
+    }
+
+    if (!is_uploaded_file($file['tmp_name'])) {
+        return ['success' => false, 'message' => 'Invalid upload source detected.'];
+    }
+
+    if (!is_numeric($admin_id) || intval($admin_id) <= 0) {
+        return ['success' => false, 'message' => 'Invalid admin reference for upload.'];
+    }
+
+    $maxSize = 2 * 1024 * 1024;
+    if ($file['size'] > $maxSize) {
+        return ['success' => false, 'message' => 'Profile image must be 2MB or smaller.'];
+    }
+
+    $allowedExtensions = ['jpg', 'jpeg', 'png', 'webp'];
+    $extension = strtolower(pathinfo($file['name'], PATHINFO_EXTENSION));
+    if ($extension === 'jpeg') {
+        $extension = 'jpg';
+    }
+    if (!in_array($extension, $allowedExtensions, true)) {
+        return ['success' => false, 'message' => 'Only JPG, PNG, or WEBP files are allowed.'];
+    }
+
+    if (function_exists('mime_content_type')) {
+        $detectedMime = mime_content_type($file['tmp_name']);
+        $allowedMimes = ['image/jpeg', 'image/png', 'image/webp'];
+        if ($detectedMime && !in_array($detectedMime, $allowedMimes, true)) {
+            return ['success' => false, 'message' => 'Unsupported image format uploaded.'];
+        }
+    }
+
+    try {
+        $directory = ensure_profile_upload_directory();
+    } catch (RuntimeException $e) {
+        return ['success' => false, 'message' => $e->getMessage()];
+    }
+
+    $cleanAdminId = intval($admin_id);
+    foreach (glob($directory . DIRECTORY_SEPARATOR . $cleanAdminId . '_*.*') as $oldFile) {
+        @unlink($oldFile);
+    }
+
+    $filename = $cleanAdminId . '_' . time() . '.' . $extension;
+    $targetPath = $directory . DIRECTORY_SEPARATOR . $filename;
+
+    if (!move_uploaded_file($file['tmp_name'], $targetPath)) {
+        return ['success' => false, 'message' => 'Failed to save profile image.'];
+    }
+
+    $relativePath = str_replace('\\', '/', str_replace(__DIR__ . DIRECTORY_SEPARATOR, '', $targetPath));
+
+    return [
+        'success' => true,
+        'path' => $relativePath,
+        'message' => 'Profile image updated successfully.'
+    ];
+}
+}
+
+if (!function_exists('get_admin_profile_image_url')) {
+function get_admin_profile_image_url($admin_id) {
+    if (!$admin_id) {
+        return null;
+    }
+
+    $directory = get_profile_upload_directory();
+    $pattern = $directory . DIRECTORY_SEPARATOR . intval($admin_id) . '_*.*';
+    $files = glob($pattern);
+
+    if (!$files) {
+        return null;
+    }
+
+    rsort($files);
+    $latest = $files[0];
+    $relativePath = str_replace('\\', '/', str_replace(__DIR__ . DIRECTORY_SEPARATOR, '', $latest));
+    $version = filemtime($latest) ?: time();
+
+    return $relativePath . '?v=' . $version;
+}
+}
+
 /**
  * Handles profile updates, including phone_number.
  */
 if (!function_exists('update_admin_profile')) {
-function update_admin_profile($pdo, $id, $new_username, $full_name, $email, $phone_number, $current_password, $new_password = null) {
+function update_admin_profile($pdo, $id, $new_username, $full_name, $email, $phone_number, $current_password, $new_password = null, $profile_image_file = null) {
     $user = get_admin_user_details($pdo, $id);
     
     if (!$user || !password_verify($current_password, $user['password_hash'])) {
@@ -288,7 +401,16 @@ function update_admin_profile($pdo, $id, $new_username, $full_name, $email, $pho
         $stmt->execute($params);
         $_SESSION['admin_username'] = $new_username;
 
-        return $message;
+        $imageMessage = '';
+        if ($profile_image_file && isset($profile_image_file['error']) && $profile_image_file['error'] !== UPLOAD_ERR_NO_FILE) {
+            $upload_result = handle_profile_image_upload($profile_image_file, $id);
+            if (!$upload_result['success']) {
+                return "Profile update failed: " . $upload_result['message'];
+            }
+            $imageMessage = " Profile photo updated!";
+        }
+
+        return $message . $imageMessage;
     } catch (PDOException $e) {
         error_log("Database Error in update_admin_profile: " . $e->getMessage());
         return "Profile update failed due to a database error.";
